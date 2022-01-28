@@ -702,8 +702,9 @@ index a448590..8478301 100644
  
  /* Parent definitions. */
 diff --git a/include/peri-mod/dma.h b/include/peri-mod/dma.h
+new file mode 100644
 index e69de29..4c075f4 100644
---- a/include/peri-mod/dma.h
+--- /dev/null
 +++ b/include/peri-mod/dma.h
 @@ -0,0 +1,197 @@
 +#ifndef _DMA_H
