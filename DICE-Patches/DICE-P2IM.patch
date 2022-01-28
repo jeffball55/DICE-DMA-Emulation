@@ -1,5 +1,39 @@
+diff --git a/cpu-exec.c b/cpu-exec.c
+index d68cc06..d8198a5 100644
+--- a/cpu-exec.c
++++ b/cpu-exec.c
+@@ -188,6 +188,8 @@ volatile int int_round = 0;
+ static inline tcg_target_ulong cpu_tb_exec(target_ulong pc, CPUState *cpu, uint8_t *tb_ptr, uint16_t size)
+ {
+     CPUArchState *env = cpu->env_ptr;
++    ARMCPU *acpu = ARM_CPU(cpu);
++    CPUARMState *aenv = &acpu->env;
+     uintptr_t next_tb;
+ 
+ #if defined(DEBUG_DISAS)
+@@ -240,8 +242,9 @@ static inline tcg_target_ulong cpu_tb_exec(target_ulong pc, CPUState *cpu, uint8
+         // interrupt firing: one interrupt/FUZZING_INT_FREQ executed
+         // after startForkserver is invoked
+         if (afl_startfs_invoked) {
+-          if (bbl_cnt % FUZZING_INT_FREQ == 0)
+-            pm_fire_interrupt();
++          if (bbl_cnt % FUZZING_INT_FREQ == 0) {
++            pm_fire_interrupt(aenv);
++					}
+         }
+ 
+         // unmodelled SR read detected
+@@ -301,7 +304,7 @@ static inline tcg_target_ulong cpu_tb_exec(target_ulong pc, CPUState *cpu, uint8
+         if ((pm_stage == SR_R_ID || pm_stage == SR_R_EXPLORE) && 
+           (bbl_cnt - bbl_cnt_last_me) >= ME_TERM_THRESHOLD) {
+           if (int_round < INT_ROUND) {
+-            pm_fire_interrupt();
++            pm_fire_interrupt(aenv);
+             bbl_cnt_last_me = bbl_cnt;
+           } else if (pm_stage == SR_R_ID) {
+             stage_termination(SR_R_ID);
 diff --git a/hw/arm/cortexm-mcu.c b/hw/arm/cortexm-mcu.c
-index 8f56c709ac..d023f11478 100644
+index 8f56c70..d023f11 100644
 --- a/hw/arm/cortexm-mcu.c
 +++ b/hw/arm/cortexm-mcu.c
 @@ -261,6 +261,9 @@ static void cortexm_mcu_realize_callback(DeviceState *dev, Error **errp)
@@ -13,28 +47,40 @@ index 8f56c709ac..d023f11478 100644
      if (verbosity_level >= VERBOSITY_COMMON) {
          const char *cmdline;
 diff --git a/hw/arm/pm_interrupt.c b/hw/arm/pm_interrupt.c
-index 01a4f3be0f..d159b22fba 100644
+index 01a4f3b..1e36076 100644
 --- a/hw/arm/pm_interrupt.c
 +++ b/hw/arm/pm_interrupt.c
-@@ -1,5 +1,7 @@
+@@ -1,5 +1,8 @@
  #include "peri-mod/peri-mod.h"
  #include "peri-mod/interrupt.h"
 +#include "peri-mod/dma.h"
++#include "cpu.h"
 +
  
  void pm_enable_interrupt(int excp_num) {
      int i;
-@@ -49,7 +51,7 @@ void pm_disable_interrupt(int excp_num) {
+@@ -49,7 +52,7 @@ void pm_disable_interrupt(int excp_num) {
  }
  
  // Round robin interrupt firing
 -void pm_fire_interrupt(void) {
-+void  pm_fire_interrupt(void) {
++void  pm_fire_interrupt(CPUARMState* env) {
      int excp_num;
      int i, idx;
  
+@@ -64,8 +67,8 @@ void pm_fire_interrupt(void) {
+         excp_num = pm_interrupt->arr[idx].int_num;
+         cortexm_nvic_set_pending(pm_interrupt->s, excp_num);
+ 
+-        qemu_log_mask(CPU_LOG_INT, "bbl_cnt %d: Fired IRQ %d\n",
+-          bbl_cnt, excp_num-16);
++        qemu_log_mask(CPU_LOG_INT, "bbl_cnt %d: Fired IRQ %d, basepri %d\n",
++          bbl_cnt, excp_num-16, env->v7m.basepri);
+ 
+         pm_interrupt->cur_int = (idx + 1) % pm_interrupt->arr_size;
+         break;
 diff --git a/hw/arm/stm32-boards.c b/hw/arm/stm32-boards.c
-index 2cb5a42338..2513264c84 100644
+index 2cb5a42..2513264 100644
 --- a/hw/arm/stm32-boards.c
 +++ b/hw/arm/stm32-boards.c
 @@ -214,6 +214,7 @@ static GPIOLEDInfo nxp_lpc4330_leds_info[] = {
@@ -278,7 +324,7 @@ index 2cb5a42338..2513264c84 100644
      qemu_register_machine(&stm32f3_discovery_machine);
      qemu_register_machine(&stm32f0_discovery_machine);
 diff --git a/hw/arm/stm32-mcus.c b/hw/arm/stm32-mcus.c
-index 20c387cd87..0b70d69939 100644
+index 20c387c..0b70d69 100644
 --- a/hw/arm/stm32-mcus.c
 +++ b/hw/arm/stm32-mcus.c
 @@ -137,6 +137,52 @@ static const STM32Capabilities stm32f103x8b = {
@@ -577,8 +623,39 @@ index 20c387cd87..0b70d69939 100644
      {
          .name = 0 /* End of array. */
      } /**/
+diff --git a/hw/intc/cortexm-nvic.c b/hw/intc/cortexm-nvic.c
+index 0bc6237..e010705 100644
+--- a/hw/intc/cortexm-nvic.c
++++ b/hw/intc/cortexm-nvic.c
+@@ -37,6 +37,11 @@
+ 
+ /* ----- Public ------------------------------------------------------------ */
+ 
++#define GIC_GET_PRIORITY2(g, irq, cpu) (((irq) < GIC_INTERNAL) ?            \
++                                    (g)->priority1[irq][cpu] :            \
++                                    (g)->priority2[(irq) - GIC_INTERNAL])
++
++
+ /* TODO: use these instead of armv7m_nvic_*(). */
+ 
+ /* The external routines use the hardware vector numbering, ie. the first
+@@ -44,9 +49,14 @@
+ void cortexm_nvic_set_pending(void *opaque, int irq)
+ {
+     CortexMNVICState *s = (CortexMNVICState *) opaque;
++
++    uint32_t prio = GIC_GET_PRIORITY2(&s->gic, irq >= 16 ? irq + 16 : irq, 0);
++		qemu_log_mask(CPU_LOG_INT, "Firing IRQ %d with priority %d\n", irq, prio);
++
+     if (irq >= 16) {
+         irq += 16;
+     }
++
+     gic_set_pending_private(&s->gic, 0, irq);
+ }
+ 
 diff --git a/include/afl/afl-qemu-cpu-inl.h b/include/afl/afl-qemu-cpu-inl.h
-index 737ac3375c..bb25482b98 100644
+index 737ac33..bb25482 100644
 --- a/include/afl/afl-qemu-cpu-inl.h
 +++ b/include/afl/afl-qemu-cpu-inl.h
 @@ -79,6 +79,7 @@ int aflGotLog = 0;              /* we've seen dmesg logging */
@@ -590,7 +667,7 @@ index 737ac3375c..bb25482b98 100644
  unsigned long aflDmesgAddr = (unsigned long)-1;
  
 diff --git a/include/hw/arm/cortexm-mcu.h b/include/hw/arm/cortexm-mcu.h
-index 23f2181900..2aab1eb011 100644
+index 23f2181..2aab1eb 100644
 --- a/include/hw/arm/cortexm-mcu.h
 +++ b/include/hw/arm/cortexm-mcu.h
 @@ -191,6 +191,8 @@ typedef struct {
@@ -603,7 +680,7 @@ index 23f2181900..2aab1eb011 100644
  
  /* ------------------------------------------------------------------------- */
 diff --git a/include/hw/arm/stm32-mcus.h b/include/hw/arm/stm32-mcus.h
-index a4485906a8..8478301456 100644
+index a448590..8478301 100644
 --- a/include/hw/arm/stm32-mcus.h
 +++ b/include/hw/arm/stm32-mcus.h
 @@ -42,10 +42,17 @@
@@ -625,9 +702,8 @@ index a4485906a8..8478301456 100644
  
  /* Parent definitions. */
 diff --git a/include/peri-mod/dma.h b/include/peri-mod/dma.h
-new file mode 100644
-index 0000000000..4c075f4f55
---- /dev/null
+index e69de29..4c075f4 100644
+--- a/include/peri-mod/dma.h
 +++ b/include/peri-mod/dma.h
 @@ -0,0 +1,197 @@
 +#ifndef _DMA_H
@@ -829,10 +905,20 @@ index 0000000000..4c075f4f55
 +#endif //_DMA_H
 \ No newline at end of file
 diff --git a/include/peri-mod/interrupt.h b/include/peri-mod/interrupt.h
-index e13a2023c4..20fa9779a2 100644
+index e13a202..64c5fe1 100644
 --- a/include/peri-mod/interrupt.h
 +++ b/include/peri-mod/interrupt.h
-@@ -10,7 +10,7 @@ typedef struct {
+@@ -1,6 +1,9 @@
+ #ifndef _INTERRUPT_H
+ #define _INTERRUPT_H
+ 
++//forward declaration
++struct CPUARMState;
++
+ typedef struct {
+     // exception number under NVIC instead of GIC
+     // NVIC: exception no = int no + 16
+@@ -10,7 +13,7 @@ typedef struct {
  } pm_Int;
  
  
@@ -841,8 +927,12 @@ index e13a2023c4..20fa9779a2 100644
  typedef struct {
      // CortexMNVICState */nvic_state *
      void *s;
-@@ -29,10 +29,10 @@ void pm_disable_interrupt(int);
- void pm_fire_interrupt(void);
+@@ -26,13 +29,13 @@ extern pm_Interrupt *pm_interrupt;
+ 
+ void pm_enable_interrupt(int);
+ void pm_disable_interrupt(int);
+-void pm_fire_interrupt(void);
++void pm_fire_interrupt(struct CPUARMState*);
  
  // pm_stage ME
 -#define INT_ROUND 1
@@ -855,7 +945,7 @@ index e13a2023c4..20fa9779a2 100644
  
  #endif /* _INTERRUPT_H */
 diff --git a/include/peri-mod/peri-mod.h b/include/peri-mod/peri-mod.h
-index 4c3f5c9cd3..f526f528ed 100644
+index bb4c06a..771e155 100644
 --- a/include/peri-mod/peri-mod.h
 +++ b/include/peri-mod/peri-mod.h
 @@ -40,7 +40,7 @@ target_ulong doneWork(target_ulong);
@@ -886,7 +976,7 @@ index 4c3f5c9cd3..f526f528ed 100644
  #define PM_UNMOD_SRRS 0x41
  #define PM_ME_EXIT 0x50
 diff --git a/memory.c b/memory.c
-index ef5c0141a0..3c11702fe8 100644
+index ef5c014..3c11702 100644
 --- a/memory.c
 +++ b/memory.c
 @@ -29,6 +29,7 @@
@@ -1288,9 +1378,8 @@ index ef5c0141a0..3c11702fe8 100644
          switch (reg->type) {
              case UC:
                  fprintf(stderr, "Uncategorized register 0x%x is accessed!\n", addr32);
-
 diff --git a/qemu-options.hx b/qemu-options.hx
-index eb434cc142..fd0776eb05 100644
+index eb434cc..fd0776e 100644
 --- a/qemu-options.hx
 +++ b/qemu-options.hx
 @@ -2788,6 +2788,8 @@ Add named fw_cfg entry from file. @var{name} determines the name of
@@ -1303,11 +1392,14 @@ index eb434cc142..fd0776eb05 100644
      "-aflFile fname  AFL input sourced from fname\n", QEMU_ARCH_ALL)
  DEF("aflPanicAddr", HAS_ARG, QEMU_OPTION_aflPanicAddr, \
 diff --git a/softmmu_template.h b/softmmu_template.h
-index acc808ce29..06d4866b0b 100644
+index acc808c..82e9dd7 100644
 --- a/softmmu_template.h
 +++ b/softmmu_template.h
-@@ -26,6 +26,8 @@
+@@ -24,8 +24,11 @@
+ #include "qemu/timer.h"
+ #include "exec/address-spaces.h"
  #include "exec/memory.h"
++#include "exec/gdbstub.h"
  // Bo: check whether address range is valid
  #include "include/hw/arm/cortexm-mcu.h"
 +#include "peri-mod/dma.h" 
@@ -1315,7 +1407,7 @@ index acc808ce29..06d4866b0b 100644
  
  #define DATA_SIZE (1 << SHIFT)
  
-@@ -171,6 +173,21 @@ static inline DATA_TYPE glue(io_read, SUFFIX)(CPUArchState *env,
+@@ -171,34 +174,397 @@ static inline DATA_TYPE glue(io_read, SUFFIX)(CPUArchState *env,
  extern CortexMState *cs_g;
  extern uint32_t cur_bbl_s, cur_bbl_e;
  
@@ -1337,7 +1429,11 @@ index acc808ce29..06d4866b0b 100644
  #ifdef SOFTMMU_CODE_ACCESS
  static __attribute__((unused))
  #endif
-@@ -181,24 +198,366 @@ WORD_TYPE helper_le_ld_name(CPUArchState *env, target_ulong addr,
+ WORD_TYPE helper_le_ld_name(CPUArchState *env, target_ulong addr,
+                             TCGMemOpIdx oi, uintptr_t retaddr)
+ {
++    CPUState *cpu = ENV_GET_CPU(env);
+     unsigned mmu_idx = get_mmuidx(oi);
      int index = (addr >> TARGET_PAGE_BITS) & (CPU_TLB_SIZE - 1);
      target_ulong tlb_addr = env->tlb_table[mmu_idx][index].ADDR_READ;
      uintptr_t haddr;
@@ -1386,8 +1482,10 @@ index acc808ce29..06d4866b0b 100644
 +            if (addr>=canaries[icanary].address && addr<(canaries[icanary].address + canaries[icanary].size) )
 +            {
 +                printf("[%x, %x] illegal read at canary 0x%x\n", cur_bbl_s, cur_bbl_e, addr);
-+                exit(-1);
-+
++                vm_stop(RUN_STATE_DEBUG);
++                cpu_loop_exit(cpu);
++                return 0;
++                //exit(-1);
 +            }
 +        }
 +    }
@@ -1415,9 +1513,14 @@ index acc808ce29..06d4866b0b 100644
 +        || 0x10001000U <= addr && addr <= 0x1000120CU //NRF52832 UICR
 +        )) {
          printf("[%x, %x] illegal read at 0x%x\n", cur_bbl_s, cur_bbl_e, addr);
-         exit(-1);
-     }
- 
+-        exit(-1);
++        printf("retaddr 0x%x\n", retaddr);
++        vm_stop(RUN_STATE_DEBUG);
++        cpu_loop_exit(cpu);
++        return 0;
++        //exit(-1);
++    }
++
 +    address_type = get_pointer_type(addr); 
 +    //check for read on DMA buffer on RAM
 +    //this check should be done only during peripheral modeling
@@ -1593,8 +1696,8 @@ index acc808ce29..06d4866b0b 100644
 +                                                                                                                                                         
 +                }              
 +        }
-+    }
-+
+     }
+ 
      /* Adjust the given return address.  */
      retaddr -= GETPC_ADJ;
  
@@ -1624,14 +1727,13 @@ index acc808ce29..06d4866b0b 100644
 +         && get_pointer_type(addr)==TRAM  )
 +         {
 +            if(DMAenabled)
-+		{
-+			printf("\nAccessing and serving DMA buffer. address: 0x%x\n", addr);
-+		}
++            {
++                printf("\nAccessing and serving DMA buffer. address: 0x%x\n", addr);
++            }
 +            else
-+	    {
-+			printf("\nAccessing DMA buffer. address: 0x%x\n", addr);
-+		
-+	    }
++            {
++                printf("\nAccessing DMA buffer. address: 0x%x\n", addr);
++            }
 +            accessDMAbuffer=true;
 +            break;
 +         }
@@ -1707,7 +1809,7 @@ index acc808ce29..06d4866b0b 100644
      /* If the TLB entry is for a different page, reload and try again.  */
      if ((addr & TARGET_PAGE_MASK)
           != (tlb_addr & (TARGET_PAGE_MASK | TLB_INVALID_MASK))) {
-@@ -226,6 +585,7 @@ WORD_TYPE helper_le_ld_name(CPUArchState *env, target_ulong addr,
+@@ -226,6 +592,7 @@ WORD_TYPE helper_le_ld_name(CPUArchState *env, target_ulong addr,
             byte ordering.  We should push the LE/BE request down into io.  */
          res = glue(io_read, SUFFIX)(env, iotlbentry, addr, retaddr);
          res = TGT_LE(res);
@@ -1715,7 +1817,7 @@ index acc808ce29..06d4866b0b 100644
          return res;
      }
  
-@@ -251,6 +611,7 @@ WORD_TYPE helper_le_ld_name(CPUArchState *env, target_ulong addr,
+@@ -251,6 +618,7 @@ WORD_TYPE helper_le_ld_name(CPUArchState *env, target_ulong addr,
  
          /* Little-endian combine.  */
          res = (res1 >> shift) | (res2 << ((DATA_SIZE * 8) - shift));
@@ -1723,7 +1825,7 @@ index acc808ce29..06d4866b0b 100644
          return res;
      }
  
-@@ -263,10 +624,13 @@ WORD_TYPE helper_le_ld_name(CPUArchState *env, target_ulong addr,
+@@ -263,10 +631,13 @@ WORD_TYPE helper_le_ld_name(CPUArchState *env, target_ulong addr,
  
      haddr = addr + env->tlb_table[mmu_idx][index].addend;
  #if DATA_SIZE == 1
@@ -1737,7 +1839,7 @@ index acc808ce29..06d4866b0b 100644
      return res;
  }
  
-@@ -403,6 +767,8 @@ static inline void glue(io_write, SUFFIX)(CPUArchState *env,
+@@ -403,25 +774,115 @@ static inline void glue(io_write, SUFFIX)(CPUArchState *env,
                                   iotlbentry->attrs);
  }
  
@@ -1746,7 +1848,8 @@ index acc808ce29..06d4866b0b 100644
  void helper_le_st_name(CPUArchState *env, target_ulong addr, DATA_TYPE val,
                         TCGMemOpIdx oi, uintptr_t retaddr)
  {
-@@ -410,18 +776,100 @@ void helper_le_st_name(CPUArchState *env, target_ulong addr, DATA_TYPE val,
++    CPUState *cpu = ENV_GET_CPU(env);
+     unsigned mmu_idx = get_mmuidx(oi);
      int index = (addr >> TARGET_PAGE_BITS) & (CPU_TLB_SIZE - 1);
      target_ulong tlb_addr = env->tlb_table[mmu_idx][index].addr_write;
      uintptr_t haddr;
@@ -1792,8 +1895,10 @@ index acc808ce29..06d4866b0b 100644
 +            if (addr>=canaries[icanary].address && addr<(canaries[icanary].address + canaries[icanary].size) )
 +            {
 +                printf("[%x, %x] illegal write at canary 0x%x\n", cur_bbl_s, cur_bbl_e, addr);
-+                exit(-1);
-+
++                vm_stop(RUN_STATE_DEBUG);
++                cpu_loop_exit(cpu);
++                return 0;
++                //exit(-1);
 +            }
 +        }
 +    }
@@ -1809,7 +1914,11 @@ index acc808ce29..06d4866b0b 100644
 +        || 0x40000000U <= addr && addr < 0x60000000U
          || 0xE0000000U <= addr && addr < 0xE0100000U)) {
          printf("[%x, %x] illegal write at 0x%x\n", cur_bbl_s, cur_bbl_e, addr);
-         exit(-1);
+-        exit(-1);
++        vm_stop(RUN_STATE_DEBUG);
++        cpu_loop_exit(cpu);
++        return 0;
++        //exit(-1);
      }
  
 +    
@@ -1849,7 +1958,7 @@ index acc808ce29..06d4866b0b 100644
      retaddr -= GETPC_ADJ;
  
 diff --git a/target-arm/helper.c b/target-arm/helper.c
-index a274d83e58..e414c68c00 100644
+index a274d83..e414c68 100644
 --- a/target-arm/helper.c
 +++ b/target-arm/helper.c
 @@ -12,6 +12,7 @@
@@ -1892,7 +2001,7 @@ index a274d83e58..e414c68c00 100644
      default:
          cpu_abort(cs, "Unhandled exception 0x%x\n", cs->exception_index);
 diff --git a/target-arm/translate.c b/target-arm/translate.c
-index 7002a3ff74..5623e56599 100644
+index 7002a3f..5623e56 100644
 --- a/target-arm/translate.c
 +++ b/target-arm/translate.c
 @@ -11659,6 +11659,7 @@ unsigned char pm_rand[PM_RAND_ARR_SIZE];
@@ -1904,7 +2013,7 @@ index 7002a3ff74..5623e56599 100644
  // XXX totally obsolete now
  static target_ulong getWork(CPUArchState *env, target_ulong ptr, target_ulong sz)
 diff --git a/tcg/i386/tcg-target.c b/tcg/i386/tcg-target.c
-index ff4d9cfec7..4bfa299ca0 100644
+index ff4d9cf..4bfa299 100644
 --- a/tcg/i386/tcg-target.c
 +++ b/tcg/i386/tcg-target.c
 @@ -1219,7 +1219,8 @@ static inline void tcg_out_tlb_load(TCGContext *s, TCGReg addrlo, TCGReg addrhi,
@@ -1918,7 +2027,7 @@ index ff4d9cfec7..4bfa299ca0 100644
      s->code_ptr += 4;
  
 diff --git a/vl.c b/vl.c
-index 57010c31af..6201d963eb 100644
+index 57010c3..6201d96 100644
 --- a/vl.c
 +++ b/vl.c
 @@ -143,6 +143,7 @@ const char *me_bin;
